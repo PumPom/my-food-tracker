@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Capture → n8n Webhook</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; padding: 20px; max-width:800px; margin:auto; }
+    h1 { font-size:1.2rem; }
+    button { margin:6px 6px 6px 0; padding:8px 12px; }
+    #status { margin-top:12px; color:#222; }
+    .preview { margin-top:12px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;}
+    img.preview-img { max-width:200px; border:1px solid #ccc; }
+    audio { display:block; max-width:300px; }
+    textarea { width:100%; height:80px; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h1>Capture → n8n Webhook</h1>
+
+  <p>
+    Webhook: <strong id="webhookUrl">Bitte URL eintragen</strong>
+  </p>
+
+  <div>
+    <button id="photoBtn">Kamera-Foto</button>
+    <button id="audioBtn">Audio-Aufnahme (Start/Stop)</button>
+  </div>
+
+  <div style="margin-top:12px;">
+    <label for="textInput"><strong>Textfeld</strong></label>
+    <textarea id="textInput" placeholder="Gib hier deinen Text ein..."></textarea>
+    <div style="margin-top:6px;">
+      <button id="sendTextBtn">Text senden (als Feld + .txt Datei)</button>
+    </div>
+  </div>
+
+  <div id="status" aria-live="polite"></div>
+
+  <div class="preview" id="preview"></div>
+
+  <script>
+    // === KONFIGURATION ===
+    // Trage hier deine n8n Webhook-URL ein, z.B.:
+    // const WEBHOOK_URL = 'https://your-n8n.example/webhook/my-webhook-path';
+    const WEBHOOK_URL = ''; // <-- HIER DEINE WEBHOOK-URL EINTRAGEN
+
+    document.getElementById('webhookUrl').textContent = WEBHOOK_URL || 'Bitte URL eintragen';
+
+    const statusEl = document.getElementById('status');
+    const previewEl = document.getElementById('preview');
+
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = msg;
+      statusEl.style.color = isError ? 'crimson' : '#222';
+    }
+
+    async function sendFormData(formData) {
+      if (!WEBHOOK_URL) {
+        setStatus('Fehler: WEBHOOK_URL ist nicht gesetzt.', true);
+        return;
+      }
+      setStatus('Sende an n8n Webhook…');
+      try {
+        const resp = await fetch(WEBHOOK_URL, {
+          method: 'POST',
+          body: formData
+          // Wichtig: nicht manuell Content-Type setzen, Browser fügt boundary für FormData hinzu
+        });
+        const text = await resp.text();
+        setStatus('Erledigt — Antwort: ' + resp.status + ' ' + resp.statusText);
+        console.log('Webhook response text:', text);
+      } catch (err) {
+        console.error(err);
+        setStatus('Fehler beim Senden: ' + err.message, true);
+      }
+    }
+
+    // ---- Foto (ein Frame) ----
+    document.getElementById('photoBtn').addEventListener('click', async () => {
+      setStatus('Kamera aktiviert — bitte Freigabe erlauben...');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const video = document.createElement('video');
+        video.style.display = 'none';
+        video.srcObject = stream;
+        document.body.appendChild(video);
+        await video.play();
+
+        // Warte ggf. auf Metadaten (Größe)
+        await new Promise(res => {
+          if (video.readyState >= 2) return res();
+          video.addEventListener('loadeddata', res, { once: true });
+        });
+
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // Bild als Blob (JPEG)
+        canvas.toBlob(async (blob) => {
+          if (!blob) {
+            setStatus('Fehler: konnte Bild nicht erzeugen', true);
+            return;
+          }
+
+          const fileName = 'photo-' + Date.now() + '.jpg';
+          const form = new FormData();
+          form.append('file', blob, fileName);
+          form.append('type', 'photo');
+          form.append('timestamp', new Date().toISOString());
+
+          // Vorschau anzeigen
+          const img = document.createElement('img');
+          img.className = 'preview-img';
+          img.src = URL.createObjectURL(blob);
+          previewEl.appendChild(img);
+
+          await sendFormData(form);
+
+          // Ressourcen bereinigen
+          stream.getTracks().forEach(t => t.stop());
+          video.remove();
+          canvas.remove();
+        }, 'image/jpeg', 0.9);
+
+      } catch (err) {
+        console.error(err);
+        setStatus('Kamera-Fehler: ' + err.message, true);
+      }
+    });
+
+    // ---- Audio (Start/Stop) ----
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let currentStream = null;
+    const audioBtn = document.getElementById('audioBtn');
+
+    audioBtn.addEventListener('click', async () => {
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        // Start recording
+        setStatus('Starte Audio-Aufnahme — bitte Freigabe erlauben...');
+        try {
+          currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(currentStream);
+          audioChunks = [];
+          mediaRecorder.ondataavailable = e => {
+            if (e.data && e.data.size) audioChunks.push(e.data);
+          };
+          mediaRecorder.onstop = async () => {
+            const blob = new Blob(audioChunks, { type: 'audio/webm' });
+            const fileName = 'audio-' + Date.now() + '.webm';
+            const form = new FormData();
+            form.append('file', blob, fileName);
+            form.append('type', 'audio');
+            form.append('timestamp', new Date().toISOString());
+
+            // Vorschau
+            const audioEl = document.createElement('audio');
+            audioEl.controls = true;
+            audioEl.src = URL.createObjectURL(blob);
+            previewEl.appendChild(audioEl);
+
+            await sendFormData(form);
+
+            if (currentStream) {
+              currentStream.getTracks().forEach(t => t.stop());
+              currentStream = null;
+            }
+            mediaRecorder = null;
+            audioBtn.textContent = 'Audio-Aufnahme (Start/Stop)';
+          };
+
+          mediaRecorder.start();
+          audioBtn.textContent = 'Stop Recording';
+          setStatus('Aufnahme läuft...');
+        } catch (err) {
+          console.error(err);
+          setStatus('Mikrofon-Fehler: ' + err.message, true);
+        }
+
+      } else if (mediaRecorder.state === 'recording') {
+        // Stop recording
+        setStatus('Beende Aufnahme …');
+        mediaRecorder.stop();
+      }
+    });
+
+    // ---- Text senden ----
+    document.getElementById('sendTextBtn').addEventListener('click', async () => {
+      const text = document.getElementById('textInput').value || '';
+      const form = new FormData();
+      form.append('text', text);
+      // zusätzlich als Datei anhängen
+      const txtBlob = new Blob([text], { type: 'text/plain' });
+      const fileName = 'text-' + Date.now() + '.txt';
+      form.append('file', txtBlob, fileName);
+      form.append('type', 'text');
+      form.append('timestamp', new Date().toISOString());
+
+      // Vorschau (kleine Darstellung)
+      const p = document.createElement('div');
+      p.textContent = 'Text gesendet: ' + (text.slice(0,120) || '[leer]');
+      previewEl.appendChild(p);
+
+      await sendFormData(form);
+    });
+
+    // Hinweis: page must be served over HTTPS (oder localhost) for getUserMedia
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+      const warning = document.createElement('div');
+      warning.style.color = 'darkorange';
+      warning.style.marginTop = '12px';
+      warning.textContent = 'Hinweis: Für Kamera/Mikrofon wird HTTPS benötigt (außer bei localhost).';
+      document.body.insertBefore(warning, statusEl);
+    }
+  </script>
+</body>
+</html>
