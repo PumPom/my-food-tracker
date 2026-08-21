@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Capture → n8n Webhook</title>
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; padding: 20px; max-width:800px; margin:auto; }
     h1 { font-size:1.2rem; }
@@ -13,6 +14,9 @@
     img.preview-img { max-width:200px; border:1px solid #ccc; }
     audio { display:block; max-width:300px; }
     textarea { width:100%; height:80px; margin-top:8px; }
+    video { width:100%; border:1px solid #ccc; margin-top:12px; }
+    #scanner { position:relative; }
+    .barcode-result { background:#e8f5e9; padding:12px; border-radius:4px; margin-top:12px; }
   </style>
 </head>
 <body>
@@ -23,8 +27,8 @@
   </p>
 
   <div>
-    <button id="photoBtn">Kamera-Foto</button>
-    <button id="audioBtn">Audio-Aufnahme (Start/Stop)</button>
+    <button id="photoBtn">📷 Barcode Scanner</button>
+    <button id="audioBtn">🎤 Audio-Aufnahme (Start/Stop)</button>
   </div>
 
   <div style="margin-top:12px;">
@@ -36,6 +40,8 @@
   </div>
 
   <div id="status" aria-live="polite"></div>
+
+  <div id="scanner"></div>
 
   <div class="preview" id="preview"></div>
 
@@ -49,6 +55,7 @@
 
     const statusEl = document.getElementById('status');
     const previewEl = document.getElementById('preview');
+    const scannerEl = document.getElementById('scanner');
 
     function setStatus(msg, isError = false) {
       statusEl.textContent = msg;
@@ -76,55 +83,99 @@
       }
     }
 
-    // ---- Foto (ein Frame) ----
+    // ---- Barcode Scanner (mit ZXing) ----
     document.getElementById('photoBtn').addEventListener('click', async () => {
-      setStatus('Kamera aktiviert — bitte Freigabe erlauben...');
+      setStatus('Barcode-Scanner aktiviert — bitte Freigabe erlauben...');
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: 'environment' } // Rückkamera verwenden
+        });
+        
         const video = document.createElement('video');
-        video.style.display = 'none';
         video.srcObject = stream;
-        document.body.appendChild(video);
-        await video.play();
+        video.style.width = '100%';
+        video.style.border = '2px solid #4CAF50';
+        video.style.marginTop = '12px';
+        video.autoplay = true;
+        scannerEl.appendChild(video);
 
-        // Warte ggf. auf Metadaten (Größe)
         await new Promise(res => {
           if (video.readyState >= 2) return res();
           video.addEventListener('loadeddata', res, { once: true });
         });
 
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth || 640;
-        canvas.height = video.videoHeight || 480;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const { BrowserMultiFormatReader } = ZXing;
+        const codeReader = new BrowserMultiFormatReader();
+        let scanning = true;
 
-        // Bild als Blob (JPEG)
-        canvas.toBlob(async (blob) => {
-          if (!blob) {
-            setStatus('Fehler: konnte Bild nicht erzeugen', true);
-            return;
+        const scanBarcode = async () => {
+          try {
+            if (!scanning) return;
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const luminanceSource = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+            const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
+
+            try {
+              const result = codeReader.decodeBitmap(binaryBitmap);
+              const barcode = result.getText();
+              
+              setStatus('✓ Barcode erkannt: ' + barcode);
+              
+              // Vorschau anzeigen
+              const resultDiv = document.createElement('div');
+              resultDiv.className = 'barcode-result';
+              resultDiv.innerHTML = `<strong>Barcode:</strong> ${barcode}<br><strong>Format:</strong> ${result.getBarcodeFormat()}`;
+              previewEl.appendChild(resultDiv);
+
+              // Sende Barcode an Webhook
+              const form = new FormData();
+              form.append('barcode', barcode);
+              form.append('format', result.getBarcodeFormat());
+              form.append('type', 'barcode');
+              form.append('timestamp', new Date().toISOString());
+              
+              await sendFormData(form);
+
+              scanning = false;
+              stream.getTracks().forEach(t => t.stop());
+              scannerEl.innerHTML = '';
+            } catch (e) {
+              // Kein Barcode gefunden, weiterscannen
+              if (scanning) {
+                requestAnimationFrame(scanBarcode);
+              }
+            }
+          } catch (err) {
+            console.error(err);
+            if (scanning) {
+              requestAnimationFrame(scanBarcode);
+            }
           }
+        };
 
-          const fileName = 'photo-' + Date.now() + '.jpg';
-          const form = new FormData();
-          form.append('file', blob, fileName);
-          form.append('type', 'photo');
-          form.append('timestamp', new Date().toISOString());
+        setStatus('Scanne auf Barcodes... (Klicke außerhalb um abzubrechen)');
+        scanBarcode();
 
-          // Vorschau anzeigen
-          const img = document.createElement('img');
-          img.className = 'preview-img';
-          img.src = URL.createObjectURL(blob);
-          previewEl.appendChild(img);
-
-          await sendFormData(form);
-
-          // Ressourcen bereinigen
+        // Abbruch durch Klick außerhalb
+        const abortHandler = () => {
+          scanning = false;
           stream.getTracks().forEach(t => t.stop());
-          video.remove();
-          canvas.remove();
-        }, 'image/jpeg', 0.9);
+          scannerEl.innerHTML = '';
+          document.removeEventListener('click', abortHandler);
+          setStatus('Barcode-Scanner beendet');
+        };
+        setTimeout(() => {
+          if (scanning) {
+            document.addEventListener('click', abortHandler);
+          }
+        }, 500);
 
       } catch (err) {
         console.error(err);
@@ -170,11 +221,11 @@
               currentStream = null;
             }
             mediaRecorder = null;
-            audioBtn.textContent = 'Audio-Aufnahme (Start/Stop)';
+            audioBtn.textContent = '🎤 Audio-Aufnahme (Start/Stop)';
           };
 
           mediaRecorder.start();
-          audioBtn.textContent = 'Stop Recording';
+          audioBtn.textContent = '⏹️ Stop Recording';
           setStatus('Aufnahme läuft...');
         } catch (err) {
           console.error(err);
